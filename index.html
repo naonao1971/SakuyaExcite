@@ -36,25 +36,163 @@
     // kit.css と同じ番号にそろえ、CHANGELOG を読んでから実機で確かめる
     import { createKit } from "https://cdn.jsdelivr.net/gh/naonao1971/sakuya-kit@0.3.3/kit.js";
 
-    // ===== ここから下がタイトル固有の中身（いまは kit の動作見本。プロトの段階で docs/PLAN.md に合わせて置き換える） =====
-    // 見本: 30秒のあいだ浮遊するCNPを集めて、岩を撃ち落とす。燃料が尽きるか残機が無くなると終わり。
-    // スコア・残機・CNPの回収・HUD・自動連射は kit の部品を使っている。
+    // ===== ここから下がタイトル固有の中身（企画は docs/PLAN.md） =====
+    // 横スクロールのモトクロス。4コースを制限時間内に抜け、コース上の CNP 11体を拾う。
+    // 絵はまだ仮（canvas の図形）。中心の遊び（アクセル・ターボと熱・ジャンプと着地・レーン・ライバル）を確かめる版
     const W = 960, H = 540;
-    const DURATION = 30 * 60;
-    const game = { ship: null, items: [], rocks: [], shots: [], timer: 0, fuel: 100, dash: 0 };
+    const BIKE_SX = 260;                      // 自機を描く画面の x
+    const LANE_Y = [300, 334, 368, 402];      // 各レーンの地面の画面 y（奥 → 手前）
+    const TRACK_TOP = 280, TRACK_BOTTOM = 422;
+    const GRAVITY = 0.32;
+    const SPEED = { accel: 5.2, turbo: 7.6, mud: 2.2 };
+    const HEAT = { turbo: 0.55, cool: 0.3, overheatFrames: 150 };
+    const CRASH_FRAMES = 90;
+    const POINTS = { cnp: 1000, perfect: 200, knock: 300, pass: 100, timeSec: 100, allCnp: 10000 };
 
-    function newShip() {
-      const cp = kit.checkpoint.value || { x: 120, y: H / 2 };
-      return { x: cp.x, y: cp.y, vx: 0, vy: 0, r: 12, inv: 90 };
+    // コース。len は長さ（px）、time は制限時間（秒）、rivals はライバルの数、level は障害の出方
+    const COURSES = [
+      { name: "竹林", en: "BAMBOO GROVE", len: 9000, time: 45, rivals: 0, level: 0, cnp: 3, sky: 150, seed: 11 },
+      { name: "棚田", en: "RICE TERRACE", len: 10000, time: 48, rivals: 3, level: 1, cnp: 3, sky: 95, seed: 23 },
+      { name: "峠", en: "MOUNTAIN PASS", len: 11000, time: 52, rivals: 5, level: 2, cnp: 3, sky: 25, seed: 37 },
+      { name: "山頂の鳥居", en: "SUMMIT TORII", len: 11500, time: 55, rivals: 6, level: 3, cnp: 2, sky: 275, seed: 53 },
+    ];
+
+    const game = { course: 0, c: null, bike: null, rivals: [], items: [], ramps: [], muds: [], hays: [],
+      timer: 0, phase: "ready", phaseT: 0, popups: [], courseBonus: 0 };
+
+    function rng(seed) {
+      let a = seed >>> 0;
+      return () => {
+        a = (a + 0x6d2b79f5) >>> 0;
+        let t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
     }
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+    // ---- コースを組む（同じコースは毎回同じ形） ----
+    function buildCourse(index, cnpStart) {
+      const c = COURSES[index];
+      const r = rng(c.seed);
+      const ramps = [], muds = [], hays = [], items = [];
+      const ramp = (x, up, height, top, down) => (ramps.push({ x, up, height, top, down, end: x + up + top + down }), x + up + top + down);
+      const lanes = (n) => { const all = [0, 1, 2, 3]; const out = []; while (out.length < n) out.push(...all.splice(Math.floor(r() * all.length), 1)); return out; };
+      // 出てくる障害。level が上がるほど後ろの種類が混ざる
+      const patterns = [
+        (x) => ramp(x, 60, 30, 0, 50),                                   // 小さいジャンプ台
+        (x) => ramp(x, 90, 80, 30, 24),                                  // 大ジャンプ（切り立った出口）
+        (x) => ramp(x, 110, 45, 220, 110),                               // 台地
+        (x) => { let e = x; for (let i = 0; i < 4; i++) e = ramp(e + 20, 30, 12, 0, 30); return e; }, // こぶの連続
+        (x) => { muds.push({ x, len: 220, lanes: lanes(2) }); return x + 220; },                    // ぬかるみ
+        (x) => { for (const l of lanes(index >= 2 ? 2 : 1)) hays.push({ x, lane: l, hit: false }); return x + 40; }, // わら束
+        (x) => { const e = ramp(x, 90, 70, 0, 30); return ramp(e + 170, 160, 60, 0, 170); },         // 二段（飛んで下り坂に着地）
+      ];
+      const pool = [0, 1, 4, 3, ...(c.level >= 1 ? [2, 5] : []), ...(c.level >= 2 ? [6, 5, 1] : []), ...(c.level >= 3 ? [6, 2, 5] : [])];
+      const features = [];
+      let x = 900;
+      while (x < c.len - 700) {
+        const kind = pool[Math.floor(r() * pool.length)];
+        const start = x;
+        x = patterns[kind](x);
+        features.push({ kind, start, end: x });
+        x += 260 + r() * (320 - c.level * 40);
+      }
+      // CNP: 大ジャンプの先の空中か、地面のレーンに置く
+      const step = features.length / c.cnp;
+      for (let i = 0; i < c.cnp; i++) {
+        const f = features[Math.floor(step * i + step / 2)];
+        const ch = kit.cnp.byNo(cnpStart + i);
+        const rp = ramps.find((q) => q.x >= f.start && q.height >= 60);
+        if (rp) items.push({ ch, x: rp.x + rp.up + rp.top + 70, lane: 1 + Math.floor(r() * 2), alt: rp.height + 22, got: false });
+        else items.push({ ch, x: f.start - 160, lane: Math.floor(r() * 4), alt: 18, got: false });
+      }
+      const rivals = [];
+      for (let i = 0; i < c.rivals; i++) {
+        rivals.push({ x: 500 + i * ((c.len - 1500) / Math.max(1, c.rivals)) + r() * 200, laneY: Math.floor(r() * 4),
+          target: 0, v: 3.6 + c.level * 0.35 + r() * 0.6, crash: 0, passed: false, hue: 90 + Math.floor(r() * 180), turn: 120 + r() * 200 });
+      }
+      for (const rv of rivals) { rv.target = rv.laneY; rv.top = rv.v; }
+      return { ramps, muds, hays, items, rivals };
+    }
+
+    // 地面の高さ（コース上の x で。上が正）
+    function ground(x) {
+      for (const q of game.ramps) {
+        if (x < q.x || x >= q.end) continue;
+        const d = x - q.x;
+        if (d < q.up) return (q.height * d) / q.up;
+        if (d < q.up + q.top) return q.height;
+        return q.height * (1 - (d - q.up - q.top) / q.down);
+      }
+      return 0;
+    }
+    const slopeAt = (x) => (ground(x + 2) - ground(x - 2)) / 4;
+    const laneIndex = (laneY) => Math.round(laneY);
+    const inMud = (x, laneY) => game.muds.some((m) => x >= m.x && x < m.x + m.len && m.lanes.includes(laneIndex(laneY)));
+    const laneScreenY = (laneY) => {
+      const i = clamp(Math.floor(laneY), 0, 2);
+      return LANE_Y[i] + (LANE_Y[i + 1] - LANE_Y[i]) * (laneY - i);
+    };
+
+    function startCourse(index) {
+      game.course = index;
+      game.c = COURSES[index];
+      const cnpStart = COURSES.slice(0, index).reduce((n, c) => n + c.cnp, 0) + 1;
+      const built = buildCourse(index, cnpStart);
+      Object.assign(game, built);
+      const lane = game.bike ? game.bike.laneY : 1;
+      game.bike = { x: 0, v: 0, laneY: lane, alt: 0, vAlt: 0, rise: 0, air: false, airT: 0, pitch: 0,
+        heat: 0, overheat: 0, crash: 0, safe: 0, wheel: 0 };
+      game.timer = game.c.time * 60;
+      game.phase = "ready";
+      game.phaseT = 0;
+      kit.sfx.stage();
+    }
+
     function reset() {
-      game.items.length = 0;
-      game.rocks.length = 0;
-      game.shots.length = 0;
-      game.timer = 0;
-      game.fuel = 100;
-      game.dash = 0;
-      game.ship = newShip();
+      game.bike = null;
+      game.popups.length = 0;
+      startCourse(0);
+    }
+
+    function popup(text, x, y, color) {
+      game.popups.push({ text, x, y, t: 50, color });
+    }
+
+    function crash(b, why) {
+      if (b.crash > 0) return;
+      b.crash = CRASH_FRAMES;
+      b.v = 0;
+      b.air = false;
+      b.alt = ground(b.x);
+      b.vAlt = 0;
+      b.safe = CRASH_FRAMES + 60;
+      kit.sfx.hit();
+      popup(why, BIKE_SX, laneScreenY(b.laneY) - 70, "danger");
+    }
+
+    function land(b) {
+      const g = ground(b.x);
+      const angle = Math.atan(slopeAt(b.x));
+      const diff = b.pitch - angle;
+      b.air = false;
+      b.alt = g;
+      b.rise = 0;
+      const longJump = b.airT > 14;
+      if (longJump && diff < -0.45) return crash(b, "前から着地!");
+      if (longJump && diff > 0.85) return crash(b, "ひっくり返った!");
+      if (longJump && Math.abs(diff) <= 0.2) {
+        kit.score.add(POINTS.perfect);
+        b.v = Math.min(b.v + 1.2, SPEED.turbo + 0.6);
+        kit.sfx.tone({ freq: 880, to: 1320, dur: 0.1, type: "square", gain: 0.12 });
+        popup(`NICE +${POINTS.perfect}`, BIKE_SX, laneScreenY(b.laneY) - b.alt - 60, "gold");
+      } else if (longJump) {
+        b.v *= 0.72;
+        kit.sfx.tone({ freq: 160, to: 90, dur: 0.08, type: "square", gain: 0.12 });
+      }
+      b.pitch = angle;
     }
 
     const kit = createKit({
@@ -63,24 +201,17 @@
       subtitle: "- RIDE FOR 11 CNP -",
       // 咲耶シリーズ共通のランキング（sakuya-kit/gas/apps-script.gs）。新しい GAS は作らない
       gasUrl: "https://script.google.com/macros/s/AKfycby-UoKAfHw4eBULVb37tQzwPEhNm65B_HUktd9Sh0ZxMdOdmnRHdub0NeeXUCAqg8bG/exec",
-      maxScore: 50000, // これを超える記録は登録させない（GAS の _games のスコア上限と同じ値にする）
+      maxScore: 50000, // 仮。仕上げで理論上の最高点から決め、GAS の _games のスコア上限と同じ値にする
       cnp: true,
-      lives: { start: 3, extendEvery: 3000 }, // 3000点ごとに1UP
       controls: {
         stick: true,
-        // 傾き操作を使うタイトルだけ有効にする（既定は使わない）
-        //   gyro: true                        … スタート時に自動で傾き操作へ（咲耶スクランブル方式）
-        //   gyro: { autoStart: false }        … 最初はスティック。📱 を長押しした人だけ傾き操作へ
-        //   gyro: { sensitivity: 0.55, deadzoneDeg: 4, maxDeg: 28 } … 効き具合の調整
-        gyro: false,
         buttons: [
-          { id: "accel", label: "X", ariaLabel: "アクセル", keys: ["KeyX", "Space"], primary: true,
-            onPress: () => { game.dash = 20; kit.sfx.shot(); } },
-          { id: "turbo", label: "Z", ariaLabel: "ターボ", keys: ["KeyZ"], onPress: () => {} },
+          { id: "accel", label: "X", ariaLabel: "アクセル", keys: ["KeyX", "Space"], primary: true },
+          { id: "turbo", label: "Z", ariaLabel: "ターボ", keys: ["KeyZ"] },
         ],
-        // 自動連射（V キー／🔫 の長押しで切り替え。タッチ端末は最初からオン）
-        //   button: "accel" で、X を短くタップで切り替える方式（咲耶ジャンプバグ方式）
-        autoFire: { button: "accel", interval: 12, onFire: () => fire() }, // 自動アクセル（X を短くタップで切り替え）
+        // 自動アクセル。X を短くタップ／V キーで切り替え（タッチ端末は最初からオン）。
+        // 押しっぱなしの代わりなので、onFire では何もせず kit.autoFire.on を見る
+        autoFire: { button: "accel", interval: 60, onFire: () => {} },
       },
       share: {
         when: "clear",
@@ -88,121 +219,413 @@
         text: (r) => `咲耶エキサイト をクリア！\nスコア ${r.score}\nCNP ${r.rescued.length}/11`,
       },
       help: { pc: "↑↓でレーン、←→で空中の傾き、Xでアクセル、Zでターボ、Vで自動アクセル、Mで音（Pキーで一時停止）" },
-      // CLEAR / GAME OVER の演出動画（パスはタイトル側の置き場所）。無ければ省略してよく、
-      // そのときはジングルと文字だけの結果画面になる。image は動画を流し終えた後の静止画
-      cutscenes: {
-        // clear: { src: "clear.mp4", image: "clear.png" },
-        // gameOver: { src: "gameover.mp4" },
-      },
+      // CLEAR / GAME OVER の演出動画（あとで用意する）。無いときはジングルと文字だけの結果画面になる
+      cutscenes: {},
 
       onStart: reset,
-      onExtend: () => kit.sfx.bonus(),
 
       update(k) {
-        const s = game.ship;
+        for (const p of game.popups) { p.t--; p.y -= 0.6; }
+        game.popups = game.popups.filter((p) => p.t > 0);
+        game.phaseT++;
+        if (game.phase === "ready") {
+          if (game.phaseT >= 90) { game.phase = "run"; game.phaseT = 0; }
+          return;
+        }
+        if (game.phase === "goal") {
+          // 残り時間をスコアへ流し込み、次のコースへ
+          if (game.timer >= 60) {
+            game.timer -= 60;
+            k.score.add(POINTS.timeSec);
+            if (game.phaseT % 4 === 0) k.sfx.tone({ freq: 1200, dur: 0.03, type: "square", gain: 0.06 });
+          } else if (game.phaseT > 150) {
+            if (game.course + 1 < COURSES.length) startCourse(game.course + 1);
+            else {
+              if (k.cnp.run.complete) k.score.add(POINTS.allCnp);
+              k.gameOver({ cleared: true, progress: 100 });
+            }
+          }
+          return;
+        }
+
+        const b = game.bike;
         const a = k.input.axis();
-        const thrust = game.dash > 0 ? 0.9 : 0.4;
-        if (game.dash > 0) game.dash--;
-        s.vx = (s.vx + a.x * thrust) * 0.9;
-        s.vy = (s.vy + a.y * thrust) * 0.9;
-        s.x = Math.max(s.r, Math.min(W - s.r, s.x + s.vx));
-        s.y = Math.max(s.r, Math.min(H - s.r, s.y + s.vy));
-        if (s.inv > 0) s.inv--;
-        game.fuel = Math.max(0, game.fuel - 0.03);
+        const ax = clamp(a.x * 2, -1, 1), ay = clamp(a.y * 2, -1, 1);
+        const accel = k.input.buttons.accel || k.autoFire.on;
+        const turbo = k.input.buttons.turbo;
 
-        if (Math.random() < 0.02) {
-          const ch = k.cnp.run.pick(); // まだ取っていないキャラほど出やすい
-          game.items.push({ ch, x: W + 30, y: 60 + Math.random() * (H - 120), t: Math.random() * 6 });
+        // 時間
+        game.timer--;
+        if (game.timer <= 0) {
+          game.timer = 0;
+          k.gameOver({ cleared: false, progress: (game.course + Math.min(1, b.x / game.c.len)) * 25 });
+          return;
         }
-        if (Math.random() < 0.025) {
-          game.rocks.push({ x: W + 20, y: 70 + Math.random() * (H - 70), r: 12 + Math.random() * 16, v: 2 + Math.random() * 3 });
-        }
-        for (const it of game.items) { it.x -= 2; it.t += 0.05; }
-        for (const r of game.rocks) r.x -= r.v;
-        for (const b of game.shots) b.x += 9;
 
-        game.items = game.items.filter((it) => {
-          const y = it.y + Math.sin(it.t) * 12;
-          if (Math.hypot(it.x - s.x, y - s.y) < 30) {
-            k.score.add(k.cnp.run.collect(it.ch.no) ? 300 : 100);
-            game.fuel = Math.min(100, game.fuel + 10);
+        // 熱
+        if (b.overheat > 0) {
+          b.overheat--;
+          b.heat = Math.max(30, b.heat - 0.5);
+          if (b.overheat === 0) b.heat = 30;
+        } else if (turbo && b.crash === 0) {
+          b.heat += HEAT.turbo;
+          if (b.heat >= 100) {
+            b.heat = 100;
+            b.overheat = HEAT.overheatFrames;
+            k.sfx.tone({ freq: 300, to: 80, dur: 0.5, type: "sawtooth", gain: 0.14 });
+            popup("OVERHEAT!", BIKE_SX, laneScreenY(b.laneY) - 70, "danger");
+          }
+        } else {
+          b.heat = Math.max(0, b.heat - HEAT.cool);
+        }
+
+        // 速さ
+        if (b.crash > 0) {
+          b.crash--;
+          b.v = 0;
+        } else if (!b.air) {
+          const mud = inMud(b.x, b.laneY);
+          let top = b.overheat > 0 ? 0 : turbo ? SPEED.turbo : accel ? SPEED.accel : 0;
+          if (mud) top = Math.min(top, SPEED.mud);
+          if (b.v < top) b.v = Math.min(top, b.v + (turbo ? 0.14 : 0.09));
+          else b.v = Math.max(top, b.v - (mud ? 0.35 : b.overheat > 0 ? 0.12 : 0.05));
+        }
+        if (b.safe > 0) b.safe--;
+
+        // レーン（地面にいるときだけ動ける）
+        if (!b.air && b.crash === 0 && Math.abs(ay) > 0.2) b.laneY = clamp(b.laneY + ay * 0.1, 0, 3);
+        else if (!b.air && Math.abs(ay) <= 0.2) {
+          const t = Math.round(b.laneY);
+          b.laneY += clamp(t - b.laneY, -0.06, 0.06);
+        }
+
+        // 進む・跳ぶ
+        const prevGround = b.alt;
+        b.x += b.v;
+        b.wheel += b.v * 0.12;
+        if (b.air) {
+          b.airT++;
+          b.vAlt -= GRAVITY;
+          b.alt += b.vAlt;
+          // 左で前を上げる（後ろに体重）、右で前を下げる。何もしなければ少しずつ前が下がる
+          b.pitch = clamp(b.pitch - ax * 0.055 - 0.004, -1.3, 1.3);
+          if (b.alt <= ground(b.x)) land(b);
+        } else if (b.crash === 0) {
+          const g = ground(b.x);
+          const ballistic = prevGround + b.rise - GRAVITY;
+          if (g < ballistic - 0.5 && b.v > 1) {
+            // 地面が先に落ちていく → 飛び出す
+            b.air = true;
+            b.airT = 0;
+            b.vAlt = b.rise - GRAVITY;
+            b.alt = ballistic;
+            b.pitch = Math.atan(b.rise / Math.max(1, b.v));
+          } else {
+            b.rise = g - prevGround;
+            b.alt = g;
+            b.pitch += (Math.atan(slopeAt(b.x)) - b.pitch) * 0.5;
+          }
+        }
+
+        // わら束
+        for (const h of game.hays) {
+          if (h.hit || Math.abs(b.laneY - h.lane) > 0.5) continue;
+          if (b.x + 18 > h.x && b.x - 18 < h.x + 24 && b.alt - ground(b.x) < 14) {
+            h.hit = true;
+            crash(b, "わらにぶつかった!");
+          }
+        }
+
+        // CNP
+        for (const it of game.items) {
+          if (it.got || Math.abs(b.laneY - it.lane) > 0.6 || Math.abs(b.x - it.x) > 30) continue;
+          if (Math.abs(b.alt + 18 - it.alt) < 44) {
+            it.got = true;
+            k.cnp.run.collect(it.ch.no);
+            k.score.add(POINTS.cnp);
             k.sfx.pickup();
-            return false;
+            popup(`${it.ch.label} +${POINTS.cnp}`, BIKE_SX, laneScreenY(b.laneY) - b.alt - 70, "gold");
           }
-          return it.x > -40;
-        });
-        game.rocks = game.rocks.filter((r) => {
-          const hit = game.shots.find((b) => Math.hypot(b.x - r.x, b.y - r.y) < r.r + 4);
-          if (hit) { hit.x = W + 99; k.score.add(50); k.sfx.explode(); return false; }
-          if (s.inv === 0 && Math.hypot(r.x - s.x, r.y - s.y) < r.r + s.r) {
-            k.sfx.hit();
-            k.checkpoint.set({ x: 120, y: s.y }); // 例: 復活地点をやられた高さにする
-            if (k.lives.lose() > 0) game.ship = newShip();
-            else return end(false), false;
-          }
-          return r.x > -40;
-        });
-        game.shots = game.shots.filter((b) => b.x < W + 20);
+        }
 
-        game.timer++;
-        if (game.fuel <= 0) end(false);
-        else if (game.timer >= DURATION) {
-          k.score.add(k.lives.value * 500 + Math.floor(game.fuel) * 10);
-          end(true);
+        // ライバル
+        for (const rv of game.rivals) {
+          if (rv.crash > 0) {
+            rv.crash--;
+            if (rv.crash === 0) rv.v = 2.5;
+          } else {
+            rv.v = Math.min(rv.v + 0.03, rv.top);
+            rv.x += rv.v;
+            if (--rv.turn <= 0) {
+              rv.target = clamp(rv.target + (Math.random() < 0.5 ? -1 : 1), 0, 3);
+              rv.turn = 150 + Math.random() * 200;
+            }
+            rv.laneY += clamp(rv.target - rv.laneY, -0.04, 0.04);
+          }
+          if (rv.crash > 0 || b.crash > 0 || Math.abs(rv.laneY - b.laneY) > 0.5) continue;
+          const rAlt = ground(rv.x);
+          const dx = rv.x - b.x;
+          if (b.air && b.vAlt < 0 && Math.abs(dx) < 26 && b.alt - rAlt < 26 && b.alt - rAlt > -6) {
+            // 上から踏んだ
+            knock(rv);
+            b.vAlt = 3.2;
+          } else if (!b.air && b.safe === 0 && Math.abs(b.alt - rAlt) < 12) {
+            if (dx > 0 && dx < 34 && b.v > rv.v) crash(b, "後輪に当たった!");
+            else if (dx < 0 && dx > -34 && rv.v > b.v) knock(rv);
+          }
+          if (!rv.passed && rv.crash === 0 && dx < -40) {
+            rv.passed = true;
+            k.score.add(POINTS.pass);
+            popup(`+${POINTS.pass}`, BIKE_SX, laneScreenY(b.laneY) - b.alt - 60, "ink");
+          }
+        }
+
+        // ゴール
+        if (b.x >= game.c.len) {
+          game.phase = "goal";
+          game.phaseT = 0;
+          k.sfx.bonus();
         }
       },
 
       render(ctx, k) {
         const { colors } = k.retro;
-        ctx.fillStyle = colors.bg;
-        ctx.fillRect(0, 0, W, H);
-        k.retro.crt();
-
         if (k.phase === "title") {
+          ctx.fillStyle = colors.bg;
+          ctx.fillRect(0, 0, W, H);
+          k.retro.crt();
           k.retro.titleText("SAKUYA EXCITE", "- RIDE FOR 11 CNP -");
-          k.cnp.chars.forEach((ch, i) => k.cnp.draw(ctx, ch, 130 + i * 70, H / 2, 56));
+          k.cnp.chars.forEach((ch, i) => k.cnp.draw(ctx, ch, 130 + i * 70, H / 2 + 60, 52));
           return;
         }
+        const b = game.bike;
+        const cam = b.x - BIKE_SX;
+        drawScenery(ctx, k, cam);
+        drawTrack(ctx, k, cam);
 
-        for (const it of game.items) k.cnp.draw(ctx, it.ch, it.x, it.y + Math.sin(it.t) * 12, 48);
-        ctx.fillStyle = k.retro.alpha(colors.ink, 0.35);
-        for (const r of game.rocks) { ctx.beginPath(); ctx.arc(r.x, r.y, r.r, 0, Math.PI * 2); ctx.fill(); }
-        ctx.fillStyle = colors.gold;
-        for (const b of game.shots) ctx.fillRect(b.x - 6, b.y - 1, 12, 3);
+        // 奥のレーンから順に描く（手前が上に重なる）
+        const actors = [];
+        for (const it of game.items) if (!it.got) actors.push({ laneY: it.lane, draw: () => drawItem(ctx, k, it, cam) });
+        for (const rv of game.rivals) actors.push({ laneY: rv.laneY, draw: () => drawRival(ctx, k, rv, cam) });
+        actors.push({ laneY: b.laneY + 0.01, draw: () => drawBike(ctx, k, b) });
+        actors.sort((p, q) => p.laneY - q.laneY);
+        for (const a of actors) a.draw();
 
-        const s = game.ship;
-        if (s && !(s.inv > 0 && k.frame % 8 < 4)) {
-          ctx.fillStyle = colors.magenta;
-          ctx.beginPath();
-          ctx.moveTo(s.x + 16, s.y);
-          ctx.lineTo(s.x - 12, s.y - 10);
-          ctx.lineTo(s.x - 12, s.y + 10);
-          ctx.fill();
+        for (const p of game.popups) {
+          ctx.font = k.retro.fontBody(16);
+          ctx.textAlign = "center";
+          ctx.fillStyle = k.retro.alpha(colors[p.color] || colors.ink, Math.min(1, p.t / 20));
+          ctx.fillText(p.text, p.x, p.y);
         }
 
         // HUD は kit の共通部品（全タイトル同じ位置・同じ見た目）
         k.hud.score();
         k.hud.roster();
-        k.hud.lives();
-        k.hud.gauge({ label: "FUEL", ratio: game.fuel / 100 });
+        k.hud.gauge({ label: "HEAT", ratio: b.heat / 100, warnBelow: b.heat >= 75 ? 2 : 0 });
         ctx.font = k.retro.font(10);
-        ctx.fillStyle = colors.dim;
         ctx.textAlign = "right";
-        ctx.fillText(`TIME ${Math.max(0, Math.ceil((DURATION - game.timer) / 60))}`, W - 16, 80);
+        ctx.fillStyle = game.timer < 10 * 60 && k.retro.blinkOn(15) ? colors.danger : colors.ink;
+        ctx.fillText(`TIME ${Math.ceil(game.timer / 60)}`, W - 16, 80);
         ctx.textAlign = "left";
+        ctx.fillStyle = colors.dim;
+        ctx.font = k.retro.font(8);
+        ctx.fillText(`COURSE ${game.course + 1}/4`, 16, 82);
+        // 進み具合のバー
+        const px = 16, pw = 150;
+        ctx.fillStyle = "rgba(4,6,12,0.7)";
+        ctx.fillRect(px, 90, pw, 6);
+        ctx.fillStyle = colors.magenta;
+        ctx.fillRect(px + 1, 91, Math.round((pw - 2) * clamp(b.x / game.c.len, 0, 1)), 4);
+
+        if (b.overheat > 0 && k.retro.blinkOn(12)) k.retro.caption("OVERHEAT", "エンジンを冷ましています");
+        if (game.phase === "ready") {
+          k.retro.caption(`COURSE ${game.course + 1}`, `${game.c.name}  ${game.c.en}` + (game.phaseT > 60 ? "  GO!" : ""));
+        }
+        if (game.phase === "goal") {
+          k.retro.caption("GOAL!", game.course + 1 < COURSES.length ? `のこり時間ボーナス  つぎは ${COURSES[game.course + 1].name}` : "山頂の鳥居に着いた!");
+        }
       },
     });
 
-    function fire() {
-      if (game.ship) game.shots.push({ x: game.ship.x + 14, y: game.ship.y });
+    function knock(rv) {
+      rv.crash = 120;
+      rv.v = 0;
+      kit.score.add(POINTS.knock);
+      kit.sfx.explode();
+      popup(`+${POINTS.knock}`, BIKE_SX + (rv.x - game.bike.x), laneScreenY(rv.laneY) - 60, "gold");
     }
-    // 救出キャラ・スコアは kit が持っているので、終わりはクリアかどうかだけ渡せばよい
-    function end(cleared) {
-      kit.gameOver({ cleared, progress: (game.timer / DURATION) * 100 });
+
+    // ---- 描画（仮の図形） ----
+    function drawScenery(ctx, k, cam) {
+      const hue = game.c.sky;
+      const sky = ctx.createLinearGradient(0, 0, 0, TRACK_TOP);
+      sky.addColorStop(0, `hsl(${hue},45%,14%)`);
+      sky.addColorStop(1, `hsl(${hue},40%,32%)`);
+      ctx.fillStyle = sky;
+      ctx.fillRect(0, 0, W, TRACK_TOP);
+      // 遠い山（ゆっくり流れる）
+      ctx.fillStyle = `hsl(${hue},25%,22%)`;
+      ctx.beginPath();
+      ctx.moveTo(0, TRACK_TOP);
+      for (let x = 0; x <= W; x += 20) {
+        const wx = (x + cam * 0.15) / 140;
+        ctx.lineTo(x, 200 - Math.sin(wx) * 40 - Math.sin(wx * 2.3) * 18);
+      }
+      ctx.lineTo(W, TRACK_TOP);
+      ctx.fill();
+      // 近い景色（コースごとに違う）
+      const near = cam * 0.5;
+      ctx.fillStyle = `hsl(${hue},35%,18%)`;
+      for (let i = Math.floor(near / 60) - 1; i < Math.floor(near / 60) + 18; i++) {
+        const x = i * 60 - near;
+        const h = 40 + ((i * 37) % 50);
+        if (game.course === 0) ctx.fillRect(x, TRACK_TOP - h - 60, 8, h + 60);           // 竹
+        else if (game.course === 1) ctx.fillRect(x, TRACK_TOP - 18 - (i % 3) * 14, 58, 6); // 棚田の段
+        else if (game.course === 2) { ctx.beginPath(); ctx.moveTo(x, TRACK_TOP); ctx.lineTo(x + 22, TRACK_TOP - h); ctx.lineTo(x + 44, TRACK_TOP); ctx.fill(); } // 杉
+        else if (i % 5 === 0) { ctx.fillStyle = k.retro.alpha(k.retro.colors.danger, 0.55); ctx.fillRect(x, TRACK_TOP - 70, 6, 70); ctx.fillRect(x + 40, TRACK_TOP - 70, 6, 70); ctx.fillRect(x - 8, TRACK_TOP - 74, 62, 7); ctx.fillStyle = `hsl(${hue},35%,18%)`; } // 鳥居
+      }
+      k.retro.crt();
     }
+
+    function drawTrack(ctx, k, cam) {
+      const { colors } = k.retro;
+      ctx.fillStyle = "hsl(28,30%,10%)";
+      ctx.fillRect(0, TRACK_TOP - 4, W, H - TRACK_TOP + 4);
+      // 列ごとに地面の高さを見て、台の上面と前面を描く
+      for (let sx = 0; sx < W; sx += 4) {
+        const wx = cam + sx;
+        const h = ground(wx);
+        const s = slopeAt(wx);
+        const l = 30 + clamp(s * 14, -10, 10);
+        ctx.fillStyle = `hsl(30,38%,${l}%)`;
+        ctx.fillRect(sx, TRACK_TOP - h, 4, TRACK_BOTTOM - TRACK_TOP);
+        if (h > 0) {
+          ctx.fillStyle = "hsl(28,34%,18%)";
+          ctx.fillRect(sx, TRACK_BOTTOM - h, 4, h);
+        }
+        // ぬかるみ
+        for (const m of game.muds) {
+          if (wx < m.x || wx >= m.x + m.len) continue;
+          ctx.fillStyle = "hsl(25,40%,16%)";
+          for (const ln of m.lanes) ctx.fillRect(sx, LANE_Y[ln] - 14 - h, 4, 22);
+        }
+      }
+      // レーンの線
+      ctx.fillStyle = k.retro.alpha(colors.ink, 0.25);
+      for (let i = 0; i < 3; i++) {
+        const y = (LANE_Y[i] + LANE_Y[i + 1]) / 2 + 4;
+        for (let sx = -((cam * 1) % 40); sx < W; sx += 40) ctx.fillRect(sx, y - ground(cam + sx), 18, 2);
+      }
+      // スタートとゴールの線
+      for (const [gx, label] of [[0, "START"], [game.c.len, "GOAL"]]) {
+        const sx = gx - cam;
+        if (sx < -40 || sx > W + 40) continue;
+        for (let i = 0; i < 12; i++) {
+          ctx.fillStyle = i % 2 ? colors.ink : colors.bg;
+          ctx.fillRect(sx, TRACK_TOP + i * ((TRACK_BOTTOM - TRACK_TOP) / 12), 10, (TRACK_BOTTOM - TRACK_TOP) / 12);
+        }
+        ctx.font = k.retro.font(10);
+        ctx.textAlign = "center";
+        ctx.fillStyle = colors.gold;
+        ctx.fillText(label, sx + 5, TRACK_TOP - 10);
+      }
+      // わら束
+      for (const h of game.hays) {
+        const sx = h.x - cam;
+        if (sx < -40 || sx > W + 40) continue;
+        const y = LANE_Y[h.lane] - ground(h.x);
+        ctx.fillStyle = h.hit ? "hsl(45,30%,35%)" : "hsl(45,60%,55%)";
+        ctx.fillRect(sx, y - 20, 24, 22);
+        ctx.fillStyle = "hsl(40,40%,30%)";
+        ctx.fillRect(sx, y - 12, 24, 3);
+      }
+    }
+
+    function drawItem(ctx, k, it, cam) {
+      const sx = it.x - cam;
+      if (sx < -40 || sx > W + 40) return;
+      const y = LANE_Y[it.lane] - it.alt - Math.sin(k.frame / 12 + it.x) * 4;
+      ctx.fillStyle = "rgba(0,0,0,0.3)";
+      ctx.beginPath();
+      ctx.ellipse(sx, LANE_Y[it.lane] - ground(it.x), 14, 4, 0, 0, Math.PI * 2);
+      ctx.fill();
+      k.cnp.draw(ctx, it.ch, sx, y - 18, 40);
+    }
+
+    function drawRider(ctx, k, color, glasses, wheel, crashT) {
+      const { colors } = k.retro;
+      // 車輪
+      ctx.strokeStyle = colors.ink;
+      ctx.lineWidth = 3;
+      for (const wx of [-15, 15]) {
+        ctx.beginPath();
+        ctx.arc(wx, -9, 9, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(wx + Math.cos(wheel) * 8, -9 + Math.sin(wheel) * 8);
+        ctx.lineTo(wx - Math.cos(wheel) * 8, -9 - Math.sin(wheel) * 8);
+        ctx.stroke();
+      }
+      // 車体
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(-16, -12); ctx.lineTo(14, -12); ctx.lineTo(20, -22); ctx.lineTo(4, -24); ctx.lineTo(-8, -18);
+      ctx.fill();
+      if (crashT > 0) return;
+      // 乗り手と ⌐◨-◨
+      ctx.fillStyle = color;
+      ctx.fillRect(-6, -40, 10, 18);
+      ctx.beginPath();
+      ctx.arc(0, -46, 8, 0, Math.PI * 2);
+      ctx.fill();
+      if (glasses) {
+        ctx.fillStyle = colors.danger;
+        ctx.fillRect(-1, -50, 7, 6); ctx.fillRect(8, -50, 7, 6); ctx.fillRect(5, -48, 3, 2); ctx.fillRect(-6, -48, 5, 2);
+        ctx.fillStyle = colors.ink;
+        ctx.fillRect(1, -49, 3, 4); ctx.fillRect(10, -49, 3, 4);
+      }
+    }
+
+    function drawBike(ctx, k, b) {
+      const gy = laneScreenY(b.laneY);
+      const g = ground(b.x);
+      // 影
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      ctx.beginPath();
+      ctx.ellipse(BIKE_SX, gy - g, 22, 5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      if (b.safe > 0 && b.crash === 0 && kit.frame % 8 < 4) return;
+      ctx.save();
+      ctx.translate(BIKE_SX, gy - b.alt);
+      ctx.rotate(b.crash > 0 ? -(b.crash * 0.35) : -b.pitch);
+      drawRider(ctx, k, k.retro.colors.magenta, true, b.wheel, b.crash);
+      ctx.restore();
+      // ターボの火
+      if (kit.input.buttons.turbo && b.overheat === 0 && b.crash === 0 && kit.frame % 4 < 2) {
+        ctx.fillStyle = k.retro.colors.gold;
+        ctx.fillRect(BIKE_SX - 34, gy - b.alt - 16, 12, 4);
+      }
+    }
+
+    function drawRival(ctx, k, rv, cam) {
+      const sx = rv.x - cam;
+      if (sx < -60 || sx > W + 60) return;
+      const gy = laneScreenY(rv.laneY) - ground(rv.x);
+      ctx.fillStyle = "rgba(0,0,0,0.35)";
+      ctx.beginPath();
+      ctx.ellipse(sx, gy, 22, 5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.save();
+      ctx.translate(sx, gy);
+      ctx.rotate(rv.crash > 0 ? -(rv.crash * 0.3) : -Math.atan(slopeAt(rv.x)));
+      drawRider(ctx, k, `hsl(${rv.hue},55%,55%)`, false, rv.x * 0.12, rv.crash);
+      ctx.restore();
+    }
+
     // 遊び方はランキングより上に出す
     document.querySelector(".sk-leaderboard").before(document.getElementById("how"));
     window.kit = kit; // デバッグ用・playtest が読む（消さない）
+    window.game = game; // プロト確認用
   </script>
 </body>
 </html>
