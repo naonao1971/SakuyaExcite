@@ -45,7 +45,10 @@
     const TRACK_TOP = 280, TRACK_BOTTOM = 422;
     const GRAVITY = 0.32;
     const SPEED = { accel: 5.2, turbo: 7.6, mud: 2.2 };
-    const HEAT = { turbo: 0.55, cool: 0.3, overheatFrames: 150 };
+    // turbo: 押している間の上がり方（0→100 で約6秒）。warn: これを超えるとビープの音程が上がりゲージが赤くなる
+    const HEAT = { turbo: 0.275, cool: 0.3, overheatFrames: 150, warn: 80 };
+    // ターボを押している間のビープ（本家と同じ）。熱が warn を超えると高く・速くなる
+    const BEEP = { normal: { freq: 740, every: 10 }, warn: { freq: 1480, every: 6 } };
     const CRASH_FRAMES = 90;
     const POINTS = { cnp: 1000, perfect: 200, knock: 300, pass: 100, timeSec: 100, allCnp: 10000 };
 
@@ -144,7 +147,7 @@
       Object.assign(game, built);
       const lane = game.bike ? game.bike.laneY : 1;
       game.bike = { x: 0, v: 0, laneY: lane, alt: 0, vAlt: 0, rise: 0, air: false, airT: 0, pitch: 0,
-        heat: 0, overheat: 0, crash: 0, safe: 0, wheel: 0 };
+        heat: 0, beep: 0, overheat: 0, crash: 0, safe: 0, wheel: 0 };
       game.timer = game.c.time * 60;
       game.phase = "ready";
       game.phaseT = 0;
@@ -269,6 +272,11 @@
           if (b.overheat === 0) b.heat = 30;
         } else if (turbo && b.crash === 0) {
           b.heat += HEAT.turbo;
+          if (--b.beep <= 0) {
+            const beep = b.heat > HEAT.warn ? BEEP.warn : BEEP.normal;
+            k.sfx.tone({ freq: beep.freq, dur: 0.05, type: "square", gain: 0.07 });
+            b.beep = beep.every;
+          }
           if (b.heat >= 100) {
             b.heat = 100;
             b.overheat = HEAT.overheatFrames;
@@ -277,6 +285,7 @@
           }
         } else {
           b.heat = Math.max(0, b.heat - HEAT.cool);
+          b.beep = 0;
         }
 
         // 速さ
@@ -421,7 +430,7 @@
         // HUD は kit の共通部品（全タイトル同じ位置・同じ見た目）
         k.hud.score();
         k.hud.roster();
-        k.hud.gauge({ label: "HEAT", ratio: b.heat / 100, warnBelow: b.heat >= 75 ? 2 : 0 });
+        k.hud.gauge({ label: "HEAT", ratio: b.heat / 100, warnBelow: b.heat > HEAT.warn ? 2 : 0 });
         ctx.font = k.retro.font(10);
         ctx.textAlign = "right";
         ctx.fillStyle = game.timer < 10 * 60 && k.retro.blinkOn(15) ? colors.danger : colors.ink;
