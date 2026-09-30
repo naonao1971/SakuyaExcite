@@ -274,7 +274,7 @@
           b.heat += HEAT.turbo;
           if (--b.beep <= 0) {
             const beep = b.heat > HEAT.warn ? BEEP.warn : BEEP.normal;
-            k.sfx.tone({ freq: beep.freq, dur: 0.05, type: "square", gain: 0.07 });
+            k.sfx.tone({ freq: beep.freq, dur: 0.07, type: "square", gain: 0.16 }); // CNP を拾う音（0.15）と同じくらいの大きさ
             b.beep = beep.every;
           }
           if (b.heat >= 100) {
