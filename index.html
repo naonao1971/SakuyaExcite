@@ -5,7 +5,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>SAKUYA EXCITE ─ RIDE FOR 11 CNP</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/naonao1971/sakuya-kit@0.3.3/kit.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/naonao1971/sakuya-kit@0.6.3/kit.css" />
   <!-- sk:head ここまで -->
   <style>
     /* タイトル固有の色だけ上書きしてよい（部品の寸法・配置は kit のまま）。例 :root { --bg: #150f1a; } */
@@ -25,7 +25,7 @@
     <ul>
       <li>⌐◨-◨ バイクで和風の山道を走り、4つのコースを制限時間内に抜けて山頂の鳥居を目指す。コース上の CNP 11体を拾おう</li>
       <li>ターボは速いがエンジンが熱くなる。熱ゲージが赤まで行くと止まる。空中は前後に傾けて、両輪そろえて着地</li>
-      <li>スマホ: 左半分を押したまま倒して上下でレーン移動・左右で空中の傾き ・ 右下の X でアクセル、Z でターボ（X を短くタップで自動アクセル）</li>
+      <li>スマホ: 左半分を押したまま倒して上下でレーン移動・左右で空中の傾き ・ A でアクセル ・ B でターボ ・ ⚙ で音・全画面・自動アクセル（設定では「自動連射」）</li>
       <li>PC: ↑↓ / W S でレーン移動 ・ ←→ / A D で空中の傾き ・ X でアクセル ・ Z でターボ ・ V 自動アクセル ・ P 一時停止 ・ M 音</li>
       <li>姉妹作: <a href="https://sakuya.naoblock.jp/">咲耶スクランブル</a> / <a href="https://rally.naoblock.jp/">咲耶Nounラリー</a> / <a href="https://jumpbug.naoblock.jp/">咲耶ジャンプバグ</a></li>
     </ul>
@@ -34,15 +34,15 @@
   <script type="module">
     // 共通部分は sakuya-kit（https://github.com/naonao1971/sakuya-kit）。版を上げるときは
     // kit.css と同じ番号にそろえ、CHANGELOG を読んでから実機で確かめる
-    import { createKit } from "https://cdn.jsdelivr.net/gh/naonao1971/sakuya-kit@0.3.3/kit.js";
+    import { createKit } from "https://cdn.jsdelivr.net/gh/naonao1971/sakuya-kit@0.6.3/kit.js";
 
     // ===== ここから下がタイトル固有の中身（企画は docs/PLAN.md） =====
     // 横スクロールのモトクロス。4コースを制限時間内に抜け、コース上の CNP 11体を拾う。
     // 絵はまだ仮（canvas の図形）。中心の遊び（アクセル・ターボと熱・ジャンプと着地・レーン・ライバル）を確かめる版
     const W = 960, H = 540;
     const BIKE_SX = 260;                      // 自機を描く画面の x
-    const LANE_Y = [300, 334, 368, 402];      // 各レーンの地面の画面 y（奥 → 手前）
-    const TRACK_TOP = 280, TRACK_BOTTOM = 422;
+    const LANE_Y = [262, 294, 326, 358];      // 各レーンの地面の画面 y（奥 → 手前）
+    const TRACK_TOP = 242, TRACK_BOTTOM = 378;
     const GRAVITY = 0.32;
     const SPEED = { accel: 5.2, turbo: 7.6, mud: 2.2 };
     // turbo: 押している間の上がり方（0→100 で約6秒）。warn: これを超えるとビープの音程が上がりゲージが赤くなる
@@ -206,15 +206,18 @@
       gasUrl: "https://script.google.com/macros/s/AKfycby-UoKAfHw4eBULVb37tQzwPEhNm65B_HUktd9Sh0ZxMdOdmnRHdub0NeeXUCAqg8bG/exec",
       maxScore: 50000, // 仮。仕上げで理論上の最高点から決め、GAS の _games のスコア上限と同じ値にする
       cnp: true,
+      offline: true, // 機内モードでも遊べるようにする（同じ場所の sw.js が要る）
       controls: {
         stick: true,
+        // シリーズ共通のボタン配置: A・B の2つと ⚙ 設定（音・全画面・自動アクセルは ⚙ の中）
+        layout: "ab",
         buttons: [
-          { id: "accel", label: "X", ariaLabel: "アクセル", keys: ["KeyX", "Space"], primary: true },
-          { id: "turbo", label: "Z", ariaLabel: "ターボ", keys: ["KeyZ"] },
+          { id: "accel", slot: "A", hint: "ACCEL", ariaLabel: "アクセル", keys: ["KeyX", "Space"] },
+          { id: "turbo", slot: "B", hint: "TURBO", ariaLabel: "ターボ", keys: ["KeyZ"] },
         ],
-        // 自動アクセル。X を短くタップ／V キーで切り替え（タッチ端末は最初からオン）。
-        // 押しっぱなしの代わりなので、onFire では何もせず kit.autoFire.on を見る
-        autoFire: { button: "accel", interval: 60, onFire: () => {} },
+        // 自動アクセル。⚙ の「自動連射」と V キーで切り替え（タッチ端末は最初からオン。端末に保存）。
+        // 押しっぱなしの代わりなので、onFire では何もせず kit.autoFire.on を見る。オンの間は A を縁取る
+        autoFire: { interval: 60, onFire: () => {}, showOn: "accel" },
       },
       share: {
         when: "clear",
